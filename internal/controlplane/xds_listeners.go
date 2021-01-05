@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"encoding/base64"
+	"fmt"
 	"net"
 	"net/url"
 	"sort"
@@ -113,7 +114,7 @@ func buildFilterChains(
 	var chains []*envoy_config_listener_v3.FilterChain
 	for _, domain := range tlsDomains {
 		// first we match on SNI
-		chains = append(chains, callback(domain, allDomains))
+		chains = append(chains, callback(domain, []string{domain}))
 	}
 	// if there are no SNI matches we match on HTTP host
 	chains = append(chains, callback("*", allDomains))
@@ -188,6 +189,47 @@ func buildMainHTTPConnectionManagerFilter(options *config.Options, domains []str
 		InlineCode: luascripts.RemoveImpersonateHeaders,
 	})
 
+	httpFilters := []*envoy_http_connection_manager.HttpFilter{
+		{
+			Name: "envoy.filters.http.lua",
+			ConfigType: &envoy_http_connection_manager.HttpFilter_TypedConfig{
+				TypedConfig: removeImpersonateHeadersLua,
+			},
+		},
+		{
+			Name: "envoy.filters.http.ext_authz",
+			ConfigType: &envoy_http_connection_manager.HttpFilter_TypedConfig{
+				TypedConfig: extAuthZ,
+			},
+		},
+		{
+			Name: "envoy.filters.http.lua",
+			ConfigType: &envoy_http_connection_manager.HttpFilter_TypedConfig{
+				TypedConfig: extAuthzSetCookieLua,
+			},
+		},
+		{
+			Name: "envoy.filters.http.lua",
+			ConfigType: &envoy_http_connection_manager.HttpFilter_TypedConfig{
+				TypedConfig: cleanUpstreamLua,
+			},
+		},
+	}
+	if len(domains) == 1 {
+		filterMisdirectedLua := marshalAny(&envoy_extensions_filters_http_lua_v3.Lua{
+			InlineCode: fmt.Sprintf(luascripts.FilterMisdirected, domains[0]),
+		})
+		httpFilters = append(httpFilters, &envoy_http_connection_manager.HttpFilter{
+			Name: "envoy.filters.http.lua",
+			ConfigType: &envoy_http_connection_manager.HttpFilter_TypedConfig{
+				TypedConfig: filterMisdirectedLua,
+			},
+		})
+	}
+	httpFilters = append(httpFilters, &envoy_http_connection_manager.HttpFilter{
+		Name: "envoy.filters.http.router",
+	})
+
 	var maxStreamDuration *durationpb.Duration
 	if options.WriteTimeout > 0 {
 		maxStreamDuration = ptypes.DurationProto(options.WriteTimeout)
@@ -199,36 +241,8 @@ func buildMainHTTPConnectionManagerFilter(options *config.Options, domains []str
 		RouteSpecifier: &envoy_http_connection_manager.HttpConnectionManager_RouteConfig{
 			RouteConfig: buildRouteConfiguration("main", virtualHosts),
 		},
-		HttpFilters: []*envoy_http_connection_manager.HttpFilter{
-			{
-				Name: "envoy.filters.http.lua",
-				ConfigType: &envoy_http_connection_manager.HttpFilter_TypedConfig{
-					TypedConfig: removeImpersonateHeadersLua,
-				},
-			},
-			{
-				Name: "envoy.filters.http.ext_authz",
-				ConfigType: &envoy_http_connection_manager.HttpFilter_TypedConfig{
-					TypedConfig: extAuthZ,
-				},
-			},
-			{
-				Name: "envoy.filters.http.lua",
-				ConfigType: &envoy_http_connection_manager.HttpFilter_TypedConfig{
-					TypedConfig: extAuthzSetCookieLua,
-				},
-			},
-			{
-				Name: "envoy.filters.http.lua",
-				ConfigType: &envoy_http_connection_manager.HttpFilter_TypedConfig{
-					TypedConfig: cleanUpstreamLua,
-				},
-			},
-			{
-				Name: "envoy.filters.http.router",
-			},
-		},
-		AccessLog: buildAccessLogs(options),
+		HttpFilters: httpFilters,
+		AccessLog:   buildAccessLogs(options),
 		CommonHttpProtocolOptions: &envoy_config_core_v3.HttpProtocolOptions{
 			IdleTimeout:       ptypes.DurationProto(options.IdleTimeout),
 			MaxStreamDuration: maxStreamDuration,

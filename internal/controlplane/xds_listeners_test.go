@@ -82,6 +82,13 @@ func Test_buildMainHTTPConnectionManagerFilter(t *testing.T) {
 					}
 				},
 				{
+					"name": "envoy.filters.http.lua",
+					"typedConfig": {
+						"@type": "type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua",
+						"inlineCode": "function envoy_on_request(request_handle)\n    local headers = request_handle:headers()\n    local metadata = request_handle:metadata()\n\n    local host = headers:get(\":authority\")\n    if host == nil then return end\n\n    local domain = \"example.com\"\n    if host ~= domain then request_handle:respond({[\":status\"] = \"421\"}, \"\") end\nend\n\nfunction envoy_on_response(response_handle) end\n"
+					}
+				},
+				{
 					"name": "envoy.filters.http.router"
 				}
 			],
