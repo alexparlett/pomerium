@@ -2,16 +2,13 @@ package authorize
 
 import (
 	"context"
-	"errors"
 	"net/url"
 	"testing"
 
 	envoy_service_auth_v2 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v2"
-	"github.com/golang/protobuf/ptypes"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc"
 
@@ -19,10 +16,8 @@ import (
 	"github.com/pomerium/pomerium/config"
 	"github.com/pomerium/pomerium/internal/encoding/jws"
 	"github.com/pomerium/pomerium/internal/httputil"
-	"github.com/pomerium/pomerium/internal/sessions"
 	"github.com/pomerium/pomerium/pkg/grpc/databroker"
 	"github.com/pomerium/pomerium/pkg/grpc/session"
-	"github.com/pomerium/pomerium/pkg/grpc/user"
 )
 
 const certPEM = `
@@ -84,8 +79,8 @@ func Test_getEvaluatorRequest(t *testing.T) {
 				},
 			},
 		},
-		&sessions.State{
-			ID:                "SESSION_ID",
+		&session.Session{
+			Id:                "SESSION_ID",
 			ImpersonateEmail:  "foo@example.com",
 			ImpersonateGroups: []string{"admin", "test"},
 		},
@@ -317,139 +312,6 @@ func Test_getEvaluatorRequestWithPortInHostHeader(t *testing.T) {
 		CustomPolicies: []string{"allow = true"},
 	}
 	assert.Equal(t, expect, actual)
-}
-
-func TestSync(t *testing.T) {
-	mockSession := func(ctx context.Context, in *databroker.GetRequest, opts ...grpc.CallOption) (*databroker.GetResponse, error) {
-		data, _ := ptypes.MarshalAny(&session.Session{
-			Id:     in.GetId(),
-			UserId: "user1",
-		})
-		return &databroker.GetResponse{
-			Record: &databroker.Record{
-				Version: "0001",
-				Type:    data.GetTypeUrl(),
-				Id:      in.GetId(),
-				Data:    data,
-			},
-		}, nil
-	}
-	mockUser := func(ctx context.Context, in *databroker.GetRequest, opts ...grpc.CallOption) (*databroker.GetResponse, error) {
-		data, _ := ptypes.MarshalAny(&user.User{Id: in.GetId()})
-		return &databroker.GetResponse{
-			Record: &databroker.Record{
-				Version: "0001",
-				Type:    data.GetTypeUrl(),
-				Id:      in.GetId(),
-				Data:    data,
-			},
-		}, nil
-	}
-
-	mockGetByType := map[string]func(ctx context.Context, in *databroker.GetRequest, opts ...grpc.CallOption) (*databroker.GetResponse, error){
-		"type.googleapis.com/session.Session": mockSession,
-		"type.googleapis.com/user.User":       mockUser,
-	}
-	dbdClient := mockDataBrokerServiceClient{
-		get: func(ctx context.Context, in *databroker.GetRequest, opts ...grpc.CallOption) (*databroker.GetResponse, error) {
-			if in.GetId() == "not-existed-id" {
-				return nil, errors.New("not found")
-			}
-			f, ok := mockGetByType[in.GetType()]
-			if !ok {
-				return nil, errors.New("not found")
-			}
-			return f(ctx, in, opts...)
-		},
-	}
-	o := &config.Options{
-		AuthenticateURL: mustParseURL("https://authN.example.com"),
-		DataBrokerURL:   mustParseURL("https://cache.example.com"),
-		SharedKey:       "gXK6ggrlIW2HyKyUF9rUO4azrDgxhDPWqw9y+lJU7B8=",
-		Policies:        testPolicies(t),
-	}
-
-	ctx := context.Background()
-
-	tests := []struct {
-		name             string
-		sessionState     *sessions.State
-		databrokerClient mockDataBrokerServiceClient
-		wantErr          bool
-	}{
-		{
-			"good with data in databroker data",
-			&sessions.State{ID: "dbd_session_id"},
-			mockDataBrokerServiceClient{
-				get: func(ctx context.Context, in *databroker.GetRequest, opts ...grpc.CallOption) (*databroker.GetResponse, error) {
-					data, _ := ptypes.MarshalAny(&session.Session{
-						Id:     in.GetId(),
-						UserId: "dbd_user1",
-					})
-					if in.GetType() == "type.googleapis.com/user.User" {
-						data, _ = ptypes.MarshalAny(&user.User{
-							Id: "dbd_user1",
-						})
-					}
-					return &databroker.GetResponse{
-						Record: &databroker.Record{
-							Version: "0001",
-							Type:    data.GetTypeUrl(),
-							Id:      in.GetId(),
-							Data:    data,
-						},
-					}, nil
-				},
-			},
-			false,
-		},
-		{"good", &sessions.State{ID: "SESSION_ID"}, dbdClient, false},
-		{"nil session state", nil, dbdClient, false},
-		{"not found session state", &sessions.State{ID: "not-existed-id"}, dbdClient, true},
-		{
-			"user not found",
-			&sessions.State{ID: "session_with_not_found_user"},
-			mockDataBrokerServiceClient{
-				get: func(ctx context.Context, in *databroker.GetRequest, opts ...grpc.CallOption) (*databroker.GetResponse, error) {
-					if in.GetType() == "type.googleapis.com/user.User" {
-						return nil, errors.New("user not found")
-					}
-					data, _ := ptypes.MarshalAny(&session.Session{
-						Id:     in.GetId(),
-						UserId: "user1",
-					})
-					return &databroker.GetResponse{
-						Record: &databroker.Record{
-							Version: "0001",
-							Type:    data.GetTypeUrl(),
-							Id:      in.GetId(),
-							Data:    data,
-						},
-					}, nil
-				},
-			},
-			false,
-		},
-	}
-
-	for _, tc := range tests {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			a, err := New(&config.Config{Options: o})
-			require.NoError(t, err)
-			a.dataBrokerData = evaluator.DataBrokerData{
-				"type.googleapis.com/session.Session": map[string]interface{}{
-					"dbd_session_id": &session.Session{UserId: "dbd_user1"},
-				},
-				"type.googleapis.com/user.User": map[string]interface{}{
-					"dbd_user1": &user.User{Id: "dbd_user1"},
-				},
-			}
-			a.state.Load().dataBrokerClient = tc.databrokerClient
-			assert.True(t, (a.forceSync(ctx, tc.sessionState) != nil) == tc.wantErr)
-		})
-	}
 }
 
 func mustParseURL(str string) *url.URL {

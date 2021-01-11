@@ -24,4 +24,7 @@ message ServiceAccount {
   string user_id = 2;
   google.protobuf.Timestamp expires_at = 3;
   google.protobuf.Timestamp issued_at = 4;
+  string impersonate_user_id = 5;
+  string impersonate_email = 6;
+  repeated string impersonate_groups = 7;
 }

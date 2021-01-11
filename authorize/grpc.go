@@ -2,7 +2,6 @@ package authorize
 
 import (
 	"context"
-	"errors"
 	"io/ioutil"
 	"net/http"
 	"net/url"
@@ -14,22 +13,16 @@ import (
 	"github.com/pomerium/pomerium/config"
 	"github.com/pomerium/pomerium/internal/httputil"
 	"github.com/pomerium/pomerium/internal/log"
-	"github.com/pomerium/pomerium/internal/sessions"
 	"github.com/pomerium/pomerium/internal/telemetry/requestid"
 	"github.com/pomerium/pomerium/internal/telemetry/trace"
 	"github.com/pomerium/pomerium/internal/urlutil"
-	"github.com/pomerium/pomerium/pkg/grpc/databroker"
-	"github.com/pomerium/pomerium/pkg/grpc/session"
-	"github.com/pomerium/pomerium/pkg/grpc/user"
 
 	envoy_api_v2_core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
 	envoy_service_auth_v2 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v2"
 )
 
 const (
-	serviceAccountTypeURL = "type.googleapis.com/user.ServiceAccount"
-	sessionTypeURL        = "type.googleapis.com/session.Session"
-	userTypeURL           = "type.googleapis.com/user.User"
+	userTypeURL = "type.googleapis.com/user.User"
 )
 
 // Check implements the envoy auth server gRPC endpoint.
@@ -54,18 +47,16 @@ func (a *Authorize) Check(ctx context.Context, in *envoy_service_auth_v2.CheckRe
 		}
 	}
 
-	rawJWT, _ := loadRawSession(hreq, a.currentOptions.Load(), state.encoder)
-	sessionState, _ := loadSession(state.encoder, rawJWT)
-
-	if err := a.forceSync(ctx, sessionState); err != nil {
-		log.Warn().Err(err).Msg("clearing session due to force sync failed")
-		sessionState = nil
+	session, err := a.loadSessionFromRequest(ctx, hreq)
+	if err != nil {
+		log.Warn().Err(err).Msg("load session error")
 	}
+	a.forceSyncUser(ctx, session)
 
 	a.dataBrokerDataLock.RLock()
 	defer a.dataBrokerDataLock.RUnlock()
 
-	req := a.getEvaluatorRequestFromCheckRequest(in, sessionState)
+	req := a.getEvaluatorRequestFromCheckRequest(in, session)
 	reply, err := state.evaluator.Evaluate(ctx, req)
 	if err != nil {
 		log.Error().Err(err).Msg("error during OPA evaluation")
@@ -85,89 +76,23 @@ func (a *Authorize) Check(ctx context.Context, in *envoy_service_auth_v2.CheckRe
 	return a.deniedResponse(in, int32(reply.Status), reply.Message, nil), nil
 }
 
-func (a *Authorize) forceSync(ctx context.Context, ss *sessions.State) error {
-	ctx, span := trace.StartSpan(ctx, "authorize.forceSync")
-	defer span.End()
-	if ss == nil {
-		return nil
-	}
-	s := a.forceSyncSession(ctx, ss.ID)
-	if s == nil {
-		return errors.New("session not found")
-	}
-	a.forceSyncUser(ctx, s.GetUserId())
-	return nil
-}
-
-func (a *Authorize) forceSyncSession(ctx context.Context, sessionID string) interface{ GetUserId() string } {
-	ctx, span := trace.StartSpan(ctx, "authorize.forceSyncSession")
-	defer span.End()
-
-	state := a.state.Load()
-
-	a.dataBrokerDataLock.RLock()
-	s, ok := a.dataBrokerData.Get(sessionTypeURL, sessionID).(*session.Session)
-	a.dataBrokerDataLock.RUnlock()
-	if ok {
-		return s
-	}
-
-	a.dataBrokerDataLock.RLock()
-	sa, ok := a.dataBrokerData.Get(serviceAccountTypeURL, sessionID).(*user.ServiceAccount)
-	a.dataBrokerDataLock.RUnlock()
-	if ok {
-		return sa
-	}
-
-	res, err := state.dataBrokerClient.Get(ctx, &databroker.GetRequest{
-		Type: sessionTypeURL,
-		Id:   sessionID,
-	})
-	if err != nil {
-		log.Warn().Err(err).Msg("failed to get session from databroker")
-		return nil
-	}
-
-	a.dataBrokerDataLock.Lock()
-	if current := a.dataBrokerData.Get(sessionTypeURL, sessionID); current == nil {
-		a.dataBrokerData.Update(res.GetRecord())
-	}
-	s, _ = a.dataBrokerData.Get(sessionTypeURL, sessionID).(*session.Session)
-	a.dataBrokerDataLock.Unlock()
-
-	return s
-}
-
-func (a *Authorize) forceSyncUser(ctx context.Context, userID string) *user.User {
+func (a *Authorize) forceSyncUser(ctx context.Context, session Session) {
 	ctx, span := trace.StartSpan(ctx, "authorize.forceSyncUser")
 	defer span.End()
 
-	state := a.state.Load()
-
-	a.dataBrokerDataLock.RLock()
-	u, ok := a.dataBrokerData.Get(userTypeURL, userID).(*user.User)
-	a.dataBrokerDataLock.RUnlock()
-	if ok {
-		return u
+	// sync user id
+	if userID := session.GetUserId(); userID != "" {
+		_, err := a.loadUser(ctx, userID)
+		if err != nil {
+			log.Warn().Err(err).Msg("load user error")
+		}
 	}
-
-	res, err := state.dataBrokerClient.Get(ctx, &databroker.GetRequest{
-		Type: userTypeURL,
-		Id:   userID,
-	})
-	if err != nil {
-		log.Warn().Err(err).Msg("failed to get user from databroker")
-		return nil
+	if userID := session.GetImpersonateUserId(); userID != "" {
+		_, err := a.loadUser(ctx, userID)
+		if err != nil {
+			log.Warn().Err(err).Msg("load user error")
+		}
 	}
-
-	a.dataBrokerDataLock.Lock()
-	if current := a.dataBrokerData.Get(userTypeURL, userID); current == nil {
-		a.dataBrokerData.Update(res.GetRecord())
-	}
-	u, _ = a.dataBrokerData.Get(userTypeURL, userID).(*user.User)
-	a.dataBrokerDataLock.Unlock()
-
-	return u
 }
 
 func (a *Authorize) getEnvoyRequestHeaders(signedJWT string) ([]*envoy_api_v2_core.HeaderValueOption, error) {
@@ -217,7 +142,7 @@ func (a *Authorize) isForwardAuth(req *envoy_service_auth_v2.CheckRequest) bool 
 	return urlutil.StripPort(checkURL.Host) == urlutil.StripPort(opts.GetForwardAuthURL().Host)
 }
 
-func (a *Authorize) getEvaluatorRequestFromCheckRequest(in *envoy_service_auth_v2.CheckRequest, sessionState *sessions.State) *evaluator.Request {
+func (a *Authorize) getEvaluatorRequestFromCheckRequest(in *envoy_service_auth_v2.CheckRequest, session Session) *evaluator.Request {
 	requestURL := getCheckRequestURL(in)
 	req := &evaluator.Request{
 		DataBrokerData: a.dataBrokerData,
@@ -227,13 +152,15 @@ func (a *Authorize) getEvaluatorRequestFromCheckRequest(in *envoy_service_auth_v
 			Headers:           getCheckRequestHeaders(in),
 			ClientCertificate: getPeerCertificate(in),
 		},
-	}
-	if sessionState != nil {
-		req.Session = evaluator.RequestSession{
-			ID:                sessionState.ID,
-			ImpersonateEmail:  sessionState.ImpersonateEmail,
-			ImpersonateGroups: sessionState.ImpersonateGroups,
-		}
+		Session: evaluator.RequestSession{
+			ID:                session.GetId(),
+			ExpiresAt:         session.GetExpiresAt(),
+			IssuedAt:          session.GetIssuedAt(),
+			UserID:            session.GetUserId(),
+			ImpersonateUserID: session.GetImpersonateUserId(),
+			ImpersonateEmail:  session.GetImpersonateEmail(),
+			ImpersonateGroups: session.GetImpersonateGroups(),
+		},
 	}
 	p := a.getMatchingPolicy(requestURL)
 	if p != nil {

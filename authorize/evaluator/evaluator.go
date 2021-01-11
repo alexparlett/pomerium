@@ -18,6 +18,7 @@ import (
 	"github.com/open-policy-agent/opa/rego"
 	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"gopkg.in/square/go-jose.v2"
 
 	"github.com/pomerium/pomerium/config"
@@ -25,7 +26,6 @@ import (
 	"github.com/pomerium/pomerium/internal/log"
 	"github.com/pomerium/pomerium/pkg/cryptutil"
 	"github.com/pomerium/pomerium/pkg/grpc/databroker"
-	"github.com/pomerium/pomerium/pkg/grpc/session"
 	"github.com/pomerium/pomerium/pkg/grpc/user"
 )
 
@@ -183,20 +183,24 @@ func (e *Evaluator) JWTPayload(req *Request) map[string]interface{} {
 	if u, err := url.Parse(req.HTTP.URL); err == nil {
 		payload["aud"] = u.Hostname()
 	}
-	if s, ok := req.DataBrokerData.Get("type.googleapis.com/session.Session", req.Session.ID).(*session.Session); ok {
-		payload["jti"] = s.GetId()
-		if tm, err := ptypes.Timestamp(s.GetIdToken().GetExpiresAt()); err == nil {
-			payload["exp"] = tm.Unix()
+	payload["jti"] = req.Session.ID
+	if tm := req.Session.ExpiresAt.AsTime(); !tm.IsZero() {
+		payload["exp"] = tm.Unix()
+	}
+	if tm := req.Session.IssuedAt.AsTime(); !tm.IsZero() {
+		payload["iat"] = tm.Unix()
+	}
+	for _, userID := range []string{req.Session.UserID, req.Session.ImpersonateUserID} {
+		if userID == "" {
+			continue
 		}
-		if tm, err := ptypes.Timestamp(s.GetIdToken().GetIssuedAt()); err == nil {
-			payload["iat"] = tm.Unix()
-		}
-		if u, ok := req.DataBrokerData.Get("type.googleapis.com/user.User", s.GetUserId()).(*user.User); ok {
+
+		if u, ok := req.DataBrokerData.Get("type.googleapis.com/user.User", userID).(*user.User); ok {
 			payload["sub"] = u.GetId()
 			payload["user"] = u.GetId()
 			payload["email"] = u.GetEmail()
 		}
-		if du, ok := req.DataBrokerData.Get("type.googleapis.com/directory.User", s.GetUserId()).(*directory.User); ok {
+		if du, ok := req.DataBrokerData.Get("type.googleapis.com/directory.User", userID).(*directory.User); ok {
 			if du.GetEmail() != "" {
 				payload["email"] = du.GetEmail()
 			}
@@ -212,7 +216,6 @@ func (e *Evaluator) JWTPayload(req *Request) map[string]interface{} {
 			payload["groups"] = groups
 		}
 	}
-
 	if req.Session.ImpersonateEmail != "" {
 		payload["email"] = req.Session.ImpersonateEmail
 	}
@@ -305,10 +308,13 @@ func (e *Evaluator) newInput(req *Request, isValidClientCertificate bool) *input
 	if i.DataBrokerData.Session == nil {
 		i.DataBrokerData.Session = req.DataBrokerData.Get(serviceAccountTypeURL, req.Session.ID)
 	}
-	if obj, ok := i.DataBrokerData.Session.(interface{ GetUserId() string }); ok {
-		i.DataBrokerData.User = req.DataBrokerData.Get(userTypeURL, obj.GetUserId())
+	for _, userID := range []string{req.Session.UserID, req.Session.ImpersonateUserID} {
+		if userID == "" {
+			continue
+		}
 
-		user, ok := req.DataBrokerData.Get(directoryUserTypeURL, obj.GetUserId()).(*directory.User)
+		i.DataBrokerData.User = req.DataBrokerData.Get(userTypeURL, userID)
+		user, ok := req.DataBrokerData.Get(directoryUserTypeURL, userID).(*directory.User)
 		if ok {
 			var groups []string
 			for _, groupID := range user.GetGroupIds() {
@@ -350,9 +356,13 @@ type (
 
 	// RequestSession is the session field in the request.
 	RequestSession struct {
-		ID                string   `json:"id"`
-		ImpersonateEmail  string   `json:"impersonate_email"`
-		ImpersonateGroups []string `json:"impersonate_groups"`
+		ID                string                 `json:"id"`
+		ExpiresAt         *timestamppb.Timestamp `json:"expires_at"`
+		IssuedAt          *timestamppb.Timestamp `json:"issued_at"`
+		UserID            string                 `json:"user_id"`
+		ImpersonateUserID string                 `json:"impersonate_user_id"`
+		ImpersonateEmail  string                 `json:"impersonate_email"`
+		ImpersonateGroups []string               `json:"impersonate_groups"`
 	}
 )
 
