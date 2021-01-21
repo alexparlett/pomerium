@@ -51,17 +51,12 @@ func (srv *Server) buildClusters(options *config.Options) []*envoy_config_cluste
 		Scheme: "http",
 		Host:   srv.HTTPListener.Addr().String(),
 	}
-	authzURL := &url.URL{
-		Scheme: options.GetAuthorizeURL().Scheme,
-		Host:   options.GetAuthorizeURL().Host,
-	}
 
 	clusters := []*envoy_config_cluster_v3.Cluster{
-		srv.buildInternalCluster(options, "pomerium-control-plane-grpc", grpcURL, true),
-		srv.buildInternalCluster(options, "pomerium-control-plane-http", httpURL, false),
+		srv.buildInternalCluster(options, "pomerium-control-plane-grpc", []*url.URL{grpcURL}, true),
+		srv.buildInternalCluster(options, "pomerium-control-plane-http", []*url.URL{httpURL}, false),
+		srv.buildInternalCluster(options, "pomerium-authorize", options.GetAuthorizeURLs(), true),
 	}
-
-	clusters = append(clusters, srv.buildInternalCluster(options, authzURL.Host, authzURL, true))
 
 	if config.IsProxy(options.Services) {
 		for i := range options.Policies {
@@ -75,8 +70,11 @@ func (srv *Server) buildClusters(options *config.Options) []*envoy_config_cluste
 	return clusters
 }
 
-func (srv *Server) buildInternalCluster(options *config.Options, name string, dst *url.URL, forceHTTP2 bool) *envoy_config_cluster_v3.Cluster {
-	endpoints := []Endpoint{NewEndpoint(dst, srv.buildInternalTransportSocket(options, dst))}
+func (srv *Server) buildInternalCluster(options *config.Options, name string, dsts []*url.URL, forceHTTP2 bool) *envoy_config_cluster_v3.Cluster {
+	var endpoints []Endpoint
+	for _, dst := range dsts {
+		endpoints = append(endpoints, NewEndpoint(dst, srv.buildInternalTransportSocket(options, dst)))
+	}
 	dnsLookupFamily := config.GetEnvoyDNSLookupFamily(options.DNSLookupFamily)
 	return buildCluster(name, endpoints, forceHTTP2, dnsLookupFamily, nil, nil)
 }
